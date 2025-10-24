@@ -101,7 +101,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 2
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
-    num_epochs: int = 10
+    num_epochs: int = 30
     warmup_steps: int = 500
     max_grad_norm: float = 1.0
     eval_steps: int = 250
@@ -112,7 +112,7 @@ class TrainingConfig:
     use_ddp: bool = False
     num_workers: int = 4
     sample_generation_steps: int = 100
-    nan_check_interval: int = 50  # Check for NaN every N steps
+    nan_check_interval: int = 50
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -226,17 +226,14 @@ class ProductionConversationDataset(Dataset):
                 prompt = str(messages[0].get('content', ''))[:800]
                 response = str(messages[1].get('content', ''))[:800]
 
-                # Quality filters
                 if len(prompt) < 10 or len(response) < 10:
                     continue
 
-                # Deduplication
                 key = (prompt[:150], response[:150])
                 if key in seen:
                     continue
                 seen.add(key)
 
-                # Tokenization
                 full_text = TextFormat.format_conversation(prompt, response)
                 tokens = self.tokenizer.encode(full_text, max_length=self.max_length)
 
@@ -281,14 +278,14 @@ def collate_fn(batch: List[torch.Tensor], pad_token_id: int = 50256) -> Tuple[to
 
 
 # ----------------------------
-# Transformer Model
+# Transformer Model (FIXED: Decoder-only)
 # ----------------------------
 class ProductionTransformer(nn.Module):
-    """Production-grade transformer with validation"""
+    """Production-grade decoder-only transformer (GPT-style) with validation"""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        config.validate()  # Ensure valid configuration
+        config.validate()
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.embed_dim)
@@ -296,7 +293,8 @@ class ProductionTransformer(nn.Module):
         self.emb_dropout = nn.Dropout(config.dropout)
         self.emb_norm = nn.LayerNorm(config.embed_dim, eps=config.layer_norm_eps)
 
-        decoder_layer = nn.TransformerDecoderLayer(
+        # FIXED: Use TransformerEncoderLayer (self-attention only, no cross-attention)
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.embed_dim,
             nhead=config.num_heads,
             dim_feedforward=config.ff_dim,
@@ -305,7 +303,8 @@ class ProductionTransformer(nn.Module):
             norm_first=True,
             activation='gelu'
         )
-        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+
         self.output_norm = nn.LayerNorm(config.embed_dim, eps=config.layer_norm_eps)
         self.output = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.output.weight = self.token_emb.weight
@@ -349,7 +348,9 @@ class ProductionTransformer(nn.Module):
         x = self.emb_dropout(x)
 
         causal_mask = self._generate_causal_mask(seq_len, device)
-        x = self.transformer(tgt=x, memory=x, tgt_mask=causal_mask, memory_mask=None)
+        # FIXED: Only self-attention with causal mask (no cross-attention)
+        x = self.transformer(x, mask=causal_mask)
+
         x = self.output_norm(x)
         logits = self.output(x)
 
@@ -386,7 +387,7 @@ class ModelValidator:
             total_tokens += targets.numel()
 
         avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-        perplexity = np.exp(min(avg_loss, 100))  # Cap to prevent inf
+        perplexity = np.exp(min(avg_loss, 100))
 
         return {
             'val_loss': avg_loss,
@@ -457,13 +458,11 @@ class InferenceEngine:
         for _ in range(max_new_tokens):
             logits = self.model(input_ids)[:, -1, :]
 
-            # Apply repetition penalty
             if repetition_penalty != 1.0 and generated_tokens:
                 self._apply_repetition_penalty(
                     logits, generated_tokens, token_freq, repetition_penalty
                 )
 
-            # Temperature scaling
             if temperature > 0:
                 logits = logits / max(temperature, 1e-8)
             else:
@@ -473,17 +472,14 @@ class InferenceEngine:
                     break
                 continue
 
-            # Top-k filtering
             if top_k is not None and top_k > 0:
                 logits = self._apply_top_k(logits, top_k)
 
-            # Top-p (nucleus) sampling
             if top_p is not None and 0.0 < top_p < 1.0:
                 probs = self._apply_top_p(logits, top_p)
             else:
                 probs = F.softmax(logits, dim=-1)
 
-            # Sample next token
             next_token = torch.multinomial(probs, num_samples=1)
             self._process_token(next_token, input_ids, generated_tokens, token_freq)
 
@@ -543,17 +539,14 @@ class InferenceEngine:
         if not generated_tokens:
             return False
 
-        # Stop on EOS
         if generated_tokens[-1] == 50256:
             return True
 
-        # Stop on repetitive patterns
         if len(generated_tokens) >= GenerationConfig.REPETITION_PATTERN_LENGTH:
             last_n = generated_tokens[-GenerationConfig.REPETITION_PATTERN_LENGTH:]
             if len(set(last_n)) == 1:
                 return True
 
-        # Stop if token appears too many times
         if generated_tokens.count(generated_tokens[-1]) > GenerationConfig.MAX_SAME_TOKEN_COUNT:
             return True
 
@@ -565,8 +558,6 @@ class InferenceEngine:
         if not generated_tokens:
             return ""
 
-        text = torch.nn.Module().forward.__self__ if False else None
-        # Simplified: just decode what we have
         from tiktoken import get_encoding
         enc = get_encoding("gpt2")
         text = enc.decode(generated_tokens)
@@ -657,7 +648,6 @@ class ProductionTrainer:
                 loss = self.criterion(logits.reshape(-1, self.model_config.vocab_size), targets.reshape(-1))
                 loss = loss / self.train_config.gradient_accumulation_steps
 
-            # NaN check
             if batch_idx % self.train_config.nan_check_interval == 0:
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(f"NaN/Inf loss detected at step {self.global_step}!")
@@ -681,15 +671,12 @@ class ProductionTrainer:
                 optimizer.zero_grad()
                 self.global_step += 1
 
-                # Sample generation
                 if self.global_step % self.train_config.sample_generation_steps == 0:
                     self._log_samples()
 
-                # Validation
                 if self.global_step % self.train_config.eval_steps == 0 and val_loader:
                     self._validate(val_loader)
 
-                # Checkpointing
                 if self.global_step % self.train_config.save_steps == 0:
                     self.save_checkpoint(f"checkpoint_step_{self.global_step}.pt")
 
@@ -743,11 +730,22 @@ class ProductionTrainer:
         logger.info(f"Saved checkpoint to {path}")
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
+        """Load model checkpoint with tolerance for architecture changes"""
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load with strict=False to handle architecture mismatches
+        missing_keys, unexpected_keys = self.model.load_state_dict(
+            checkpoint['model_state_dict'],
+            strict=False
+        )
+
+        if missing_keys:
+            logger.warning(f"Missing keys (will be re-initialized): {missing_keys}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys (ignored): {unexpected_keys}")
+
         self.global_step = checkpoint.get('global_step', 0)
-        logger.info(f"Loaded checkpoint from {path}")
+        logger.info(f"Loaded checkpoint from {path} at step {self.global_step}")
 
 
 # ----------------------------
@@ -769,7 +767,7 @@ def main():
         batch_size=32,
         gradient_accumulation_steps=2,
         learning_rate=5e-5,
-        num_epochs=20,
+        num_epochs=18,
         warmup_steps=500,
         eval_steps=250,
         save_steps=1000,
@@ -857,9 +855,10 @@ def main():
     if checkpoints:
         latest_ckpt = checkpoints[-1]
         logger.info(f"Resuming training from checkpoint: {latest_ckpt}")
-        trainer.load_checkpoint(latest_ckpt)
+        trainer.load_checkpoint(str(latest_ckpt))
 
     trainer.train(train_loader, val_loader)
+
 
 if __name__ == '__main__':
     main()
